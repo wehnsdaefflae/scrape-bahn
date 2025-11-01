@@ -168,8 +168,12 @@ async def search_connection(page: Page, origin: str, destination: str, departure
         return False
 
 
-async def extract_stops_from_connection(page: Page) -> Tuple[List[str], List[str], str]:
-    """Extract intermediate stops from the first suitable connection."""
+async def extract_stops_from_connection(page: Page) -> Tuple[List[str], List[str], List[str]]:
+    """Extract intermediate stops from the first suitable connection.
+
+    Returns:
+        Tuple of (stations, times, train_ids) where train_ids[i] is the train ID for station i
+    """
     log("Extracting stops from connection details...")
 
     # Find the first connection with a reasonable duration (prefer direct or few transfers)
@@ -240,58 +244,99 @@ async def extract_stops_from_connection(page: Page) -> Tuple[List[str], List[str
     except:
         pass
 
-    # Extract all stations and times using JavaScript for better structure
-    log("  Extracting stations and times...")
+    # Extract all stations, times, and per-segment train IDs using JavaScript
+    log("  Extracting stations, times, and train IDs per segment...")
 
-    stations_data = await page.evaluate('''() => {
-        const result = {
-            stations: [],
-            times: []
-        };
+    segments_data = await page.evaluate('''() => {
+        const segments = [];
 
-        // Get origin halt (first .verbindungs-halt)
-        const halts = document.querySelectorAll('.verbindungs-halt');
-        if (halts.length > 0) {
-            const originLink = halts[0].querySelector('a[href*="bahnhof.de"]');
-            const originTime = halts[0].querySelector('time');
-            if (originLink && originTime) {
-                result.stations.push(originLink.textContent.trim());
-                result.times.push(originTime.textContent.trim());
+        // Find all train segments (.verbindungs-abschnitt)
+        const abschnitte = document.querySelectorAll('.verbindungs-abschnitt');
+
+        abschnitte.forEach((abschnitt, segmentIndex) => {
+            const segment = {
+                trainId: null,
+                stations: [],
+                times: []
+            };
+
+            // Get train ID for this segment from ri-transport-chip element
+            const trainChip = abschnitt.querySelector('ri-transport-chip');
+            if (trainChip) {
+                segment.trainId = trainChip.getAttribute('transport-text');
             }
-        }
 
-        // Get intermediate stops
-        const zwischenhalte = document.querySelectorAll('.verbindungs-zwischenhalte__zwischenhalt-container');
-        zwischenhalte.forEach(container => {
-            const name = container.querySelector('.verbindungs-zwischenhalt__name')?.textContent.trim();
-            const departureTime = container.querySelector('.verbindungs-zwischenhalt__abfahrts-zeit time')?.textContent.trim();
+            // Get all halts in this segment
+            const halts = abschnitt.querySelectorAll('.verbindungs-halt');
 
-            if (name && departureTime) {
-                result.stations.push(name);
-                result.times.push(departureTime);
+            // Origin (first halt)
+            if (halts.length > 0) {
+                const originLink = halts[0].querySelector('a[href*="bahnhof.de"]');
+                const originTime = halts[0].querySelector('time');
+                if (originLink && originTime) {
+                    segment.stations.push(originLink.textContent.trim());
+                    segment.times.push(originTime.textContent.trim());
+                }
+            }
+
+            // Intermediate stops in this segment
+            const zwischenhalte = abschnitt.querySelectorAll('.verbindungs-zwischenhalte__zwischenhalt-container');
+            zwischenhalte.forEach(container => {
+                const name = container.querySelector('.verbindungs-zwischenhalt__name')?.textContent.trim();
+                const departureTime = container.querySelector('.verbindungs-zwischenhalt__abfahrts-zeit time')?.textContent.trim();
+
+                if (name && departureTime) {
+                    segment.stations.push(name);
+                    segment.times.push(departureTime);
+                }
+            });
+
+            // Destination (last halt) - only add if it's different from last added station
+            if (halts.length > 1) {
+                const destLink = halts[halts.length - 1].querySelector('a[href*="bahnhof.de"]');
+                const destTime = halts[halts.length - 1].querySelector('time');
+                if (destLink && destTime) {
+                    const destStation = destLink.textContent.trim();
+                    const destTimeStr = destTime.textContent.trim();
+                    // Add destination
+                    segment.stations.push(destStation);
+                    segment.times.push(destTimeStr);
+                }
+            }
+
+            if (segment.stations.length > 0) {
+                segments.push(segment);
             }
         });
 
-        // Get destination halt (last .verbindungs-halt)
-        if (halts.length > 1) {
-            const destLink = halts[halts.length - 1].querySelector('a[href*="bahnhof.de"]');
-            const destTime = halts[halts.length - 1].querySelector('time');
-            if (destLink && destTime) {
-                result.stations.push(destLink.textContent.trim());
-                result.times.push(destTime.textContent.trim());
-            }
-        }
-
-        return result;
+        return segments;
     }''')
 
-    stations = stations_data['stations']
-    times = stations_data['times']
+    # Flatten segments into single lists with train ID mapping
+    stations = []
+    times = []
+    train_ids = []
 
-    log(f"  Found {len(stations)} stations: {stations}")
-    log(f"  Train: {train_number}, Date: {date_str}")
+    for segment in segments_data:
+        train_id = segment['trainId'] or train_number
+        segment_stations = segment['stations']
+        segment_times = segment['times']
 
-    return stations, times, train_number
+        for i, (station, time) in enumerate(zip(segment_stations, segment_times)):
+            # Skip if this is the first station of a non-first segment and it's the same as the last added station
+            # (destination of previous segment = origin of current segment)
+            if stations and station == stations[-1]:
+                continue
+
+            stations.append(station)
+            times.append(time)
+            train_ids.append(train_id)
+
+    log(f"  Found {len(stations)} stations across {len(segments_data)} train segment(s)")
+    log(f"  Stations: {stations}")
+    log(f"  Train IDs per station: {train_ids}")
+
+    return stations, times, train_ids
 
 
 async def get_ticket_price(page: Page, origin: str, destination: str, departure_time: str, departure_date: str = None, expected_train_id: str = None) -> Optional[float]:
@@ -363,7 +408,7 @@ async def get_ticket_price(page: Page, origin: str, destination: str, departure_
 
 
 async def create_price_matrix(page: Page, stations: List[str], times: List[str],
-                               departure_time: str, departure_date: str = None, train_id: str = None) -> List[List[Optional[float]]]:
+                               departure_time: str, departure_date: str = None, train_ids: List[str] = None) -> List[List[Optional[float]]]:
     """Create a price matrix for all station pairs.
 
     Args:
@@ -372,7 +417,7 @@ async def create_price_matrix(page: Page, stations: List[str], times: List[str],
         times: List of departure times for each station
         departure_time: Initial departure time
         departure_date: Departure date (DD.MM.YYYY format)
-        train_id: Train ID to verify all segments are from the same connection
+        train_ids: List of train IDs per station (train_ids[i] = train ID for station i)
 
     Returns:
         Price matrix where prices[i][j] is the price from station i to station j
@@ -380,19 +425,34 @@ async def create_price_matrix(page: Page, stations: List[str], times: List[str],
     n = len(stations)
     prices = [[None for _ in range(n)] for _ in range(n)]
 
+    # Calculate total number of combinations to query
+    total_combinations = n * (n - 1) // 2
+    current_combination = 0
+
     log(f"\nCreating price matrix for {n} stations...")
-    if train_id:
-        log(f"  Verifying all segments are from train: {train_id}")
+    log(f"  Total segment combinations to query: {total_combinations}")
+    if train_ids:
+        unique_trains = set(train_ids)
+        log(f"  Connection uses {len(unique_trains)} train(s): {', '.join(sorted(unique_trains))}")
 
     # Get prices for all combinations where i < j (only forward direction)
     for i in range(n):
         for j in range(i + 1, n):
+            current_combination += 1
             # Use the departure time of the origin station (station i)
             segment_departure_time = times[i]
-            price = await get_ticket_price(page, stations[i], stations[j], segment_departure_time, departure_date, train_id)
+            # Use the train ID of the departure station (station i)
+            segment_train_id = train_ids[i] if train_ids else None
+            log(f"\n  [{current_combination}/{total_combinations}] Querying: {stations[i]} → {stations[j]} (dep. {segment_departure_time}, train: {segment_train_id})")
+            price = await get_ticket_price(page, stations[i], stations[j], segment_departure_time, departure_date, segment_train_id)
+            if price is not None:
+                log(f"    ✓ Price: €{price:.2f}")
+            else:
+                log(f"    ✗ Price not available (train ID mismatch or not found)")
             prices[i][j] = price
             # No extra wait needed - search_connection already waits for page load
 
+    log(f"\n✓ Price matrix complete: {current_combination} segments queried")
     return prices
 
 
@@ -540,17 +600,24 @@ async def main():
                 return 1
 
             # Step 2: Extract all intermediate stops
-            stations, times, train_number = await extract_stops_from_connection(page)
+            stations, times, train_ids = await extract_stops_from_connection(page)
 
             if len(stations) < 2:
                 log("Error: Could not extract enough stations from the connection")
                 return 1
 
+            # For TSV header: use first train if single-train, or "Multiple" for multi-train connections
+            unique_trains = list(set(train_ids))
+            if len(unique_trains) == 1:
+                train_display = unique_trains[0]
+            else:
+                train_display = f"Multiple ({', '.join(sorted(unique_trains))})"
+
             # Step 3: Get prices for all segment combinations
-            prices = await create_price_matrix(page, stations, times, args.time, search_date, train_number)
+            prices = await create_price_matrix(page, stations, times, args.time, search_date, train_ids)
 
             # Step 4: Write to TSV file
-            write_tsv_file(output_file, search_date, train_number, stations, times, prices)
+            write_tsv_file(output_file, search_date, train_display, stations, times, prices)
 
             log(f"\n✓ Successfully created price matrix!")
             log(f"✓ Output file: {output_file}")
