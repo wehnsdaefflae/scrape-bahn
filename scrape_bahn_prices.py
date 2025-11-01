@@ -509,7 +509,7 @@ async def main():
     parser.add_argument('--headed', action='store_true',
                         help='Run browser in headed mode (visible browser window, default)')
     parser.add_argument('--connect', action='store_true',
-                        help='Connect to existing browser at localhost:9222 (requires debug_browser.py to be running)')
+                        help='Connect to existing browser at localhost:9222 (use debug_browser.py or Chrome with --remote-debugging-port=9222)')
 
     args = parser.parse_args()
 
@@ -563,7 +563,7 @@ async def main():
                     log(f"✓ Connected to existing browser! Created new tab.")
             except Exception as e:
                 log(f"Error connecting to browser: {e}")
-                log("Make sure debug_browser.py is running first!")
+                log("Make sure debug_browser.py is running or Chrome is started with --remote-debugging-port=9222")
                 return 1
         else:
             # Launch new browser
